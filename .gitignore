@@ -1,0 +1,15 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Credentials (never commit these!)
+service_account.json
+
+# IDE
+.vscode/
+.idea/
+
+# Project
+.claude/
