@@ -19,10 +19,13 @@ load_dotenv()
 # Initialize FastMCP server
 mcp = FastMCP("text2sql")
 
-# Configuration paths
-CONFIG_FILE = "config.json"
-CONTEXT_FILE = "context.md"
-SERVICE_ACCOUNT_FILE = "service_account.json"
+# Get directory where this script lives (for resolving relative paths)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Configuration paths (anchored to script location, not cwd)
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
+CONTEXT_FILE = os.path.join(SCRIPT_DIR, "context.md")
+SERVICE_ACCOUNT_FILE = os.path.join(SCRIPT_DIR, "service_account.json")
 
 # Global state
 _bq_client = None

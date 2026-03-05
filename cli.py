@@ -20,8 +20,11 @@ def cmd_init():
     print("  TEXT-TO-SQL ACCESS CONTROL - Setup")
     print("=" * 60)
 
+    # Get directory where this script lives
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
     config = {}
-    config_file = "config.json"
+    config_file = os.path.join(script_dir, "config.json")
 
     # Load existing config if present
     if os.path.exists(config_file):
@@ -50,12 +53,12 @@ def cmd_init():
 
     # Check for service account
     print("\n2. Service Account")
-    sa_file = "service_account.json"
+    sa_file = os.path.join(script_dir, "service_account.json")
     if os.path.exists(sa_file):
         print(f"   Found: {sa_file}")
     else:
-        print(f"   Warning: {sa_file} not found.")
-        print("   Place your service account JSON file in this directory.")
+        print(f"   Warning: service_account.json not found.")
+        print(f"   Place your service account JSON file in: {script_dir}")
 
     # Save config
     with open(config_file, "w") as f:
