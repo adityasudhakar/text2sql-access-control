@@ -103,28 +103,35 @@ def cmd_chat():
     conversation_history = []
 
     # Build system prompt with tool descriptions
-    system_prompt = """You are a text-to-SQL assistant with access control capabilities.
+    system_prompt = """You are a text-to-SQL assistant with column-level access control.
 
-You have access to these tools (call them by generating SQL or using the appropriate function):
+You have access to these tools:
 
-1. read_context() - Read the scratchpad with schema, learned values, and SQL examples
-2. write_context(content, section) - Add to scratchpad (sections: schema, learned_values, sql_examples, notes)
-3. run_query(sql) - Execute SQL with access control applied
+DATA TOOLS:
+1. read_context() - Read schema, learned values, and SQL examples
+2. write_context(content, section) - Add to scratchpad (schema, learned_values, sql_examples, notes)
+3. run_query(sql) - Execute SQL with access control applied automatically
 4. preview_query(sql) - Preview SQL with access control WITHOUT executing
-5. manage_access_rules(operation, ...) - Manage access dimensions (list/get/set/remove)
-6. manage_identity(operation, ...) - Manage simulated user (get/set/clear/list_users)
-7. configure_dataset(dataset, users_table) - Configure BigQuery connection
+
+ACCESS CONTROL TOOLS:
+5. suggest_restricted_columns(description) - Given a description like "salary data", suggest matching columns
+6. set_column_restriction(column_name, rule_type, ...) - Set restriction on a column
+7. list_restrictions() - List all configured restrictions
+8. remove_restriction(column_name) - Remove restriction from a column
+
+IDENTITY & CONFIG:
+9. manage_identity(operation, ...) - Manage simulated user (get/set/clear/list_users)
+10. configure_dataset(dataset, users_table) - Configure BigQuery connection
+
+HOW ACCESS CONTROL WORKS:
+- When a query touches a restricted column, an enforcer LLM rewrites the SQL
+- Restrictions are based on exact column name matching
+- Rule types: "self_only" (users see own data) or "role_based" (only certain roles)
 
 When users ask questions:
 - For data questions: Generate SQL and use run_query
-- For admin tasks: Use the appropriate management tool
+- For admin setup: Use suggest_restricted_columns, then set_column_restriction
 - Check schema first if unsure about table/column names
-
-Always think about:
-1. What does the user want?
-2. Do I need to check the schema first?
-3. What SQL would answer this question?
-4. Is access control relevant here?
 """
 
     # Tool definitions for Claude
@@ -148,7 +155,7 @@ Always think about:
         },
         {
             "name": "run_query",
-            "description": "Execute SQL query with access control applied",
+            "description": "Execute SQL query with access control applied automatically",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -169,29 +176,56 @@ Always think about:
             }
         },
         {
-            "name": "manage_access_rules",
-            "description": "Manage access control dimensions",
+            "name": "suggest_restricted_columns",
+            "description": "Given a natural language description of sensitive data, suggest matching columns from the schema",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "operation": {"type": "string", "enum": ["list", "get", "set", "remove"]},
-                    "dimension_name": {"type": "string"},
-                    "user_attribute": {"type": "string"},
-                    "source_table": {"type": "string"},
-                    "source_column": {"type": "string"},
-                    "value_mapping": {"type": "string", "description": "JSON string"}
+                    "description": {"type": "string", "description": "Description like 'salary data' or 'personal information'"}
                 },
-                "required": ["operation"]
+                "required": ["description"]
+            }
+        },
+        {
+            "name": "set_column_restriction",
+            "description": "Set access control restriction on a specific column",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "column_name": {"type": "string", "description": "The column to restrict (e.g., 'employees.salary')"},
+                    "rule_type": {"type": "string", "enum": ["self_only", "role_based"], "description": "Type of restriction"},
+                    "user_id_column": {"type": "string", "description": "For self_only: column that identifies the user"},
+                    "user_id_field": {"type": "string", "description": "For self_only: field in user record with their ID (default: 'id')"},
+                    "allowed_roles": {"type": "string", "description": "For role_based: JSON array of allowed roles"},
+                    "role_field": {"type": "string", "description": "For role_based: field in user record with their role"}
+                },
+                "required": ["column_name", "rule_type"]
+            }
+        },
+        {
+            "name": "list_restrictions",
+            "description": "List all configured column restrictions",
+            "input_schema": {"type": "object", "properties": {}, "required": []}
+        },
+        {
+            "name": "remove_restriction",
+            "description": "Remove access control restriction from a column",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "column_name": {"type": "string", "description": "The column to unrestrict"}
+                },
+                "required": ["column_name"]
             }
         },
         {
             "name": "manage_identity",
-            "description": "Manage simulated user identity",
+            "description": "Manage simulated user identity for testing",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "operation": {"type": "string", "enum": ["get", "set", "clear", "list_users"]},
-                    "user_identifier": {"type": "string"}
+                    "user_identifier": {"type": "string", "description": "Name, username, or email to identify user (for set)"}
                 },
                 "required": ["operation"]
             }
@@ -202,8 +236,8 @@ Always think about:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "dataset": {"type": "string"},
-                    "users_table": {"type": "string"}
+                    "dataset": {"type": "string", "description": "BigQuery dataset in format 'project.dataset'"},
+                    "users_table": {"type": "string", "description": "Name of table containing user information"}
                 },
                 "required": []
             }
@@ -220,15 +254,21 @@ Always think about:
             return server.run_query(args.get("sql", ""))
         elif name == "preview_query":
             return server.preview_query(args.get("sql", ""))
-        elif name == "manage_access_rules":
-            return server.manage_access_rules(
-                args.get("operation", "list"),
-                args.get("dimension_name"),
-                args.get("user_attribute"),
-                args.get("source_table"),
-                args.get("source_column"),
-                args.get("value_mapping")
+        elif name == "suggest_restricted_columns":
+            return server.suggest_restricted_columns(args.get("description", ""))
+        elif name == "set_column_restriction":
+            return server.set_column_restriction(
+                args.get("column_name", ""),
+                args.get("rule_type", ""),
+                args.get("user_id_column"),
+                args.get("user_id_field", "id"),
+                args.get("allowed_roles"),
+                args.get("role_field", "role")
             )
+        elif name == "list_restrictions":
+            return server.list_restrictions()
+        elif name == "remove_restriction":
+            return server.remove_restriction(args.get("column_name", ""))
         elif name == "manage_identity":
             return server.manage_identity(
                 args.get("operation", "get"),
@@ -251,15 +291,15 @@ Always think about:
         print(f"\nDataset: {config['dataset']}")
         if config.get("users_table"):
             print(f"Users table: {config['users_table']}")
-        if config.get("access_dimensions"):
-            print(f"Access dimensions: {', '.join(config['access_dimensions'].keys())}")
+        if config.get("restricted_columns"):
+            print(f"Restricted columns: {', '.join(config['restricted_columns'].keys())}")
     else:
         print("\nNo dataset configured. Say 'configure dataset project.dataset'")
 
     print("\nTalk to me naturally. Examples:")
     print("  'what tables are available?'")
     print("  'users are in sales_people table'")
-    print("  'set up geography access control'")
+    print("  'restrict salary to self-only access'")
     print("  'test as Alex Brown'")
     print("  'what are total sales?'")
     print("  'exit' to quit")

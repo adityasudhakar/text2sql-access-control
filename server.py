@@ -1,16 +1,20 @@
 """
-Text-to-SQL MCP Server with Access Control
+Text-to-SQL MCP Server with Column-Level Access Control
 
-An MCP server that provides text-to-SQL capabilities with role-based access control.
-Can be used standalone or as a sub-agent for any MCP-compatible client.
+An MCP server that provides text-to-SQL capabilities with column-level access control.
+Uses an enforcer LLM to rewrite SQL when sensitive columns are detected.
 """
 
 import os
 import json
-import re
 from typing import Any
 from google.cloud import bigquery
+from anthropic import Anthropic
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+# Load environment
+load_dotenv()
 
 # Initialize FastMCP server
 mcp = FastMCP("text2sql")
@@ -24,6 +28,18 @@ SERVICE_ACCOUNT_FILE = "service_account.json"
 _bq_client = None
 _config = None
 _current_identity = None
+_anthropic_client = None
+
+
+def _get_anthropic() -> Anthropic:
+    """Get or create Anthropic client"""
+    global _anthropic_client
+    if _anthropic_client is None:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY not set")
+        _anthropic_client = Anthropic(api_key=api_key)
+    return _anthropic_client
 
 
 def _get_config() -> dict:
@@ -72,137 +88,167 @@ def _load_schema(dataset: str) -> dict:
     return schema
 
 
-def _find_table_alias(sql: str, table_name: str, dataset: str) -> str:
-    """Find the alias for a table in the SQL query, or return the full table name."""
-    full_table = f"`{dataset}.{table_name}`"
-    pattern = rf'{re.escape(full_table)}\s+(?:AS\s+)?(\w+)'
-    match = re.search(pattern, sql, re.IGNORECASE)
-    if match:
-        return match.group(1)
-    return full_table
+def _get_all_columns(dataset: str) -> list:
+    """Get all column names from all tables in the dataset"""
+    schema = _load_schema(dataset)
+    if "error" in schema:
+        return []
+    columns = []
+    for table_name, table_info in schema.items():
+        for col in table_info["columns"]:
+            columns.append({
+                "table": table_name,
+                "column": col["name"],
+                "type": col["type"],
+                "full_name": f"{table_name}.{col['name']}"
+            })
+    return columns
+
+
+def _check_restricted_columns(sql: str, config: dict) -> list:
+    """
+    Check if SQL contains any restricted columns.
+    Returns list of matched restrictions.
+    """
+    restricted_columns = config.get("restricted_columns", {})
+    matches = []
+
+    sql_lower = sql.lower()
+    for column_name, rule in restricted_columns.items():
+        # Exact match on column name
+        if column_name.lower() in sql_lower:
+            matches.append({
+                "column": column_name,
+                "rule": rule
+            })
+
+    return matches
+
+
+def _enforcer_rewrite(sql: str, restriction: dict, current_user: dict, config: dict) -> dict:
+    """
+    Use enforcer LLM to rewrite SQL with access control.
+    The enforcer only sees the SQL and the rule - no user input.
+    """
+    column = restriction["column"]
+    rule = restriction["rule"]
+
+    # Build the enforcement instruction
+    if rule["type"] == "self_only":
+        user_id_column = rule["user_id_column"]
+        user_id_value = current_user.get(rule.get("user_id_field", "id"))
+
+        if user_id_value is None:
+            return {
+                "success": False,
+                "error": f"Cannot determine user ID for access control",
+                "sql": sql
+            }
+
+        instruction = f"""Rewrite this SQL to add an access control filter.
+
+RULE: The column '{column}' is restricted. Users can only see their own data.
+FILTER TO ADD: {user_id_column} = '{user_id_value}'
+
+Original SQL:
+{sql}
+
+Requirements:
+1. Add a WHERE clause (or AND condition) to filter by {user_id_column} = '{user_id_value}'
+2. Keep the query logic otherwise identical
+3. Return ONLY the modified SQL, no explanations
+
+Modified SQL:"""
+
+    elif rule["type"] == "role_based":
+        allowed_roles = rule.get("allowed_roles", [])
+        user_role = current_user.get(rule.get("role_field", "role"))
+
+        if user_role not in allowed_roles:
+            return {
+                "success": False,
+                "error": f"Access denied: role '{user_role}' cannot access '{column}'",
+                "sql": sql
+            }
+        # Role is allowed, no rewrite needed
+        return {"success": True, "sql": sql, "rules_applied": []}
+
+    else:
+        return {
+            "success": False,
+            "error": f"Unknown rule type: {rule['type']}",
+            "sql": sql
+        }
+
+    # Call enforcer LLM
+    try:
+        client = _get_anthropic()
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": instruction}]
+        )
+
+        modified_sql = response.content[0].text.strip()
+        # Clean up any markdown
+        if modified_sql.startswith("```"):
+            modified_sql = modified_sql.split("\n", 1)[1]
+        if modified_sql.endswith("```"):
+            modified_sql = modified_sql.rsplit("```", 1)[0]
+        modified_sql = modified_sql.strip()
+
+        return {
+            "success": True,
+            "sql": modified_sql,
+            "original_sql": sql,
+            "rules_applied": [f"{column}: restricted to {user_id_column}='{user_id_value}'"]
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Enforcer error: {e}",
+            "sql": sql
+        }
 
 
 def _apply_access_control(sql: str, user: dict, config: dict) -> dict:
     """
-    Apply access control to SQL query.
-    Returns dict with modified SQL and metadata about applied rules.
+    Apply column-level access control to SQL query.
+    1. Check if SQL contains any restricted columns
+    2. If yes, use enforcer LLM to rewrite
     """
     if user is None:
+        # Admin mode - no restrictions
         return {"sql": sql, "rules_applied": [], "access_restricted": False}
 
-    access_dimensions = config.get("access_dimensions", {})
-    if not access_dimensions:
+    # Check for restricted columns
+    matches = _check_restricted_columns(sql, config)
+
+    if not matches:
         return {"sql": sql, "rules_applied": [], "access_restricted": False}
 
-    dataset = config.get("dataset", "")
-    schema = _load_schema(dataset)
-    if "error" in schema:
-        return {"sql": sql, "rules_applied": [], "error": schema["error"]}
+    # Apply each restriction via enforcer
+    current_sql = sql
+    all_rules_applied = []
 
-    joins_to_add = []
-    where_conditions = []
-    rules_applied = []
+    for match in matches:
+        result = _enforcer_rewrite(current_sql, match, user, config)
 
-    # Find tables in query
-    tables_in_query = []
-    for table in schema.keys():
-        if f"`{dataset}.{table}`" in sql or f" {table}" in sql.lower():
-            tables_in_query.append(table)
+        if not result["success"]:
+            return {
+                "sql": sql,
+                "error": result["error"],
+                "access_denied": True
+            }
 
-    # Infer foreign keys
-    foreign_keys = {}
-    for table_name, table_info in schema.items():
-        foreign_keys[table_name] = {}
-        for col in table_info["columns"]:
-            col_name = col["name"].lower()
-            if col_name.endswith("_id") and col_name != "id":
-                potential_table = col_name[:-3]
-                for other_table in schema.keys():
-                    other_lower = other_table.lower()
-                    if other_lower == potential_table or other_lower == potential_table + "s":
-                        foreign_keys[table_name][col["name"]] = f"{other_table}.id"
-                        break
-
-    for dim_name, dim_config in access_dimensions.items():
-        user_attr = dim_config.get("user_attribute")
-        user_value = user.get(user_attr)
-
-        if not user_value or user_value == "All":
-            continue
-
-        source_table = dim_config.get("source_table")
-        source_column = dim_config.get("source_column")
-        value_mapping = dim_config.get("value_mapping", {})
-        filter_value = value_mapping.get(user_value, user_value)
-
-        for table in tables_in_query:
-            if table == source_table:
-                table_ref = _find_table_alias(sql, table, dataset)
-                if filter_value == "__NOT__":
-                    exclude_value = value_mapping.get("__exclude__", "")
-                    where_conditions.append(f"{table_ref}.{source_column} != '{exclude_value}'")
-                    rules_applied.append(f"{dim_name}: excluding {source_column}='{exclude_value}'")
-                else:
-                    where_conditions.append(f"{table_ref}.{source_column} = '{filter_value}'")
-                    rules_applied.append(f"{dim_name}: {source_column}='{filter_value}'")
-
-            elif table in foreign_keys:
-                for fk_col, fk_ref in foreign_keys[table].items():
-                    ref_table = fk_ref.split(".")[0]
-                    ref_col = fk_ref.split(".")[1]
-
-                    if ref_table == source_table:
-                        if source_table not in tables_in_query:
-                            joins_to_add.append(
-                                f"JOIN `{dataset}.{source_table}` ON `{dataset}.{table}`.{fk_col} = `{dataset}.{source_table}`.{ref_col}"
-                            )
-                        source_ref = _find_table_alias(sql, source_table, dataset)
-                        if filter_value == "__NOT__":
-                            exclude_value = value_mapping.get("__exclude__", "")
-                            where_conditions.append(f"{source_ref}.{source_column} != '{exclude_value}'")
-                            rules_applied.append(f"{dim_name}: excluding {source_column}='{exclude_value}' (via {table}.{fk_col})")
-                        else:
-                            where_conditions.append(f"{source_ref}.{source_column} = '{filter_value}'")
-                            rules_applied.append(f"{dim_name}: {source_column}='{filter_value}' (via {table}.{fk_col})")
-                        break
-
-    where_conditions = list(set(where_conditions))
-    joins_to_add = list(set(joins_to_add))
-
-    if not joins_to_add and not where_conditions:
-        return {"sql": sql, "rules_applied": [], "access_restricted": False}
-
-    modified_sql = sql
-
-    if joins_to_add:
-        from_match = re.search(r'(FROM\s+`[^`]+`)', modified_sql, re.IGNORECASE)
-        if from_match:
-            join_str = " " + " ".join(joins_to_add)
-            modified_sql = modified_sql[:from_match.end()] + join_str + modified_sql[from_match.end():]
-
-    if where_conditions:
-        combined = " AND ".join(where_conditions)
-
-        if re.search(r'\bWHERE\b', modified_sql, re.IGNORECASE):
-            modified_sql = re.sub(r'\bWHERE\b', f'WHERE ({combined}) AND ', modified_sql, count=1, flags=re.IGNORECASE)
-        else:
-            # Find insertion point, stripping any trailing whitespace before GROUP BY/ORDER BY/LIMIT
-            for pattern in [r'\s*\bGROUP\s+BY\b', r'\s*\bORDER\s+BY\b', r'\s*\bLIMIT\b']:
-                match = re.search(pattern, modified_sql, re.IGNORECASE)
-                if match:
-                    # Insert WHERE clause, preserving the matched keyword
-                    keyword_start = match.start()
-                    keyword_text = modified_sql[match.start():match.end()].lstrip()
-                    modified_sql = modified_sql[:keyword_start] + f"\nWHERE {combined}\n{keyword_text}" + modified_sql[match.end():]
-                    break
-            else:
-                modified_sql = modified_sql.rstrip(';') + f"\nWHERE {combined}"
+        current_sql = result["sql"]
+        all_rules_applied.extend(result.get("rules_applied", []))
 
     return {
-        "sql": modified_sql,
+        "sql": current_sql,
         "original_sql": sql,
-        "rules_applied": rules_applied,
-        "access_restricted": True
+        "rules_applied": all_rules_applied,
+        "access_restricted": bool(all_rules_applied)
     }
 
 
@@ -235,18 +281,15 @@ def write_context(content: str, section: str = "notes") -> str:
     if section not in valid_sections:
         return f"Invalid section. Must be one of: {valid_sections}"
 
-    # Read existing content
     existing = ""
     if os.path.exists(CONTEXT_FILE):
         with open(CONTEXT_FILE, "r") as f:
             existing = f.read()
 
-    # Find or create section
     section_header = f"## {section.replace('_', ' ').title()}"
     if section_header not in existing:
         existing += f"\n\n{section_header}\n"
 
-    # Append to section
     lines = existing.split('\n')
     new_lines = []
     in_section = False
@@ -257,7 +300,6 @@ def write_context(content: str, section: str = "notes") -> str:
         if line.strip() == section_header:
             in_section = True
         elif in_section and line.startswith("## "):
-            # Start of new section, insert content before it
             new_lines.insert(-1, content)
             content_added = True
             in_section = False
@@ -275,7 +317,8 @@ def write_context(content: str, section: str = "notes") -> str:
 def run_query(sql: str) -> str:
     """
     Execute a SQL query against BigQuery with access control applied.
-    Access control is automatically enforced based on the current user identity.
+    If the query touches restricted columns, it will be automatically rewritten
+    by the enforcer to apply access control rules.
 
     Args:
         sql: The SQL query to execute
@@ -289,7 +332,10 @@ def run_query(sql: str) -> str:
     # Apply access control
     result = _apply_access_control(sql, _current_identity, config)
 
-    if "error" in result:
+    if result.get("access_denied"):
+        return f"Access Denied: {result.get('error')}"
+
+    if result.get("error"):
         return f"Error applying access control: {result['error']}"
 
     controlled_sql = result["sql"]
@@ -351,7 +397,9 @@ def preview_query(sql: str) -> str:
 
     output.append("")
 
-    if result.get("access_restricted"):
+    if result.get("access_denied"):
+        output.append(f"ACCESS DENIED: {result.get('error')}")
+    elif result.get("access_restricted"):
         output.append("Modified SQL (with access control):")
         output.append(result["sql"])
         output.append("")
@@ -365,81 +413,159 @@ def preview_query(sql: str) -> str:
 
 
 @mcp.tool()
-def manage_access_rules(
-    operation: str,
-    dimension_name: str = None,
-    user_attribute: str = None,
-    source_table: str = None,
-    source_column: str = None,
-    value_mapping: str = None
-) -> str:
+def suggest_restricted_columns(description: str) -> str:
     """
-    Manage access control dimensions.
+    Given a natural language description of what should be restricted,
+    suggest matching columns from the schema.
 
     Args:
-        operation: One of 'list', 'get', 'set', 'remove'
-        dimension_name: Name of the dimension (required for get/set/remove)
-        user_attribute: Column in users table that determines access (for set)
-        source_table: Table containing the data to filter (for set)
-        source_column: Column to filter on (for set)
-        value_mapping: JSON string mapping user values to DB values (for set)
+        description: Natural language description like "salary data" or "personal information"
     """
     config = _get_config()
-    access_dimensions = config.get("access_dimensions", {})
+    dataset = config.get("dataset")
 
-    if operation == "list":
-        if not access_dimensions:
-            return "No access dimensions configured."
-        output = ["Configured access dimensions:"]
-        for name, dim in access_dimensions.items():
-            output.append(f"\n{name}:")
-            output.append(f"  User attribute: {dim.get('user_attribute')}")
-            output.append(f"  Source: {dim.get('source_table')}.{dim.get('source_column')}")
-            if dim.get('value_mapping'):
-                output.append(f"  Value mapping: {json.dumps(dim.get('value_mapping'))}")
+    if not dataset:
+        return "Error: No dataset configured."
+
+    columns = _get_all_columns(dataset)
+    if not columns:
+        return "Error: Could not load schema."
+
+    # Format columns for Claude
+    columns_str = "\n".join([f"- {c['full_name']} ({c['type']})" for c in columns])
+
+    prompt = f"""Given this description of sensitive data: "{description}"
+
+And these available columns:
+{columns_str}
+
+Which columns match what the user wants to restrict?
+Return a JSON array of column names that match, e.g.: ["employees.salary", "employees.ssn"]
+Only include exact column names from the list above.
+Return ONLY the JSON array, no explanation."""
+
+    try:
+        client = _get_anthropic()
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        result = response.content[0].text.strip()
+        # Parse to validate
+        suggested = json.loads(result)
+
+        output = [f"Based on '{description}', these columns might be sensitive:"]
+        for col in suggested:
+            output.append(f"  - {col}")
+        output.append("")
+        output.append("To restrict a column, use: set_column_restriction")
+
         return "\n".join(output)
+    except Exception as e:
+        return f"Error: {e}"
 
-    elif operation == "get":
-        if not dimension_name:
-            return "Error: dimension_name required for 'get' operation"
-        if dimension_name not in access_dimensions:
-            return f"Dimension '{dimension_name}' not found."
-        dim = access_dimensions[dimension_name]
-        return json.dumps(dim, indent=2)
 
-    elif operation == "set":
-        if not all([dimension_name, user_attribute, source_table, source_column]):
-            return "Error: dimension_name, user_attribute, source_table, source_column all required for 'set'"
+@mcp.tool()
+def set_column_restriction(
+    column_name: str,
+    rule_type: str,
+    user_id_column: str = None,
+    user_id_field: str = "id",
+    allowed_roles: str = None,
+    role_field: str = "role"
+) -> str:
+    """
+    Set access control restriction on a specific column.
 
-        mapping = {}
-        if value_mapping:
-            try:
-                mapping = json.loads(value_mapping)
-            except json.JSONDecodeError:
-                return "Error: value_mapping must be valid JSON"
+    Args:
+        column_name: The column to restrict (e.g., "employees.salary")
+        rule_type: Either "self_only" (users see own data) or "role_based" (only certain roles)
+        user_id_column: For self_only: which column identifies the user (e.g., "employee_id")
+        user_id_field: For self_only: which field in user record has their ID (default: "id")
+        allowed_roles: For role_based: JSON array of allowed roles (e.g., '["admin", "hr"]')
+        role_field: For role_based: which field in user record has their role (default: "role")
+    """
+    config = _get_config()
+    restricted_columns = config.get("restricted_columns", {})
 
-        access_dimensions[dimension_name] = {
-            "user_attribute": user_attribute,
-            "source_table": source_table,
-            "source_column": source_column,
-            "value_mapping": mapping
+    if rule_type == "self_only":
+        if not user_id_column:
+            return "Error: user_id_column required for 'self_only' rule"
+
+        restricted_columns[column_name] = {
+            "type": "self_only",
+            "user_id_column": user_id_column,
+            "user_id_field": user_id_field
         }
-        config["access_dimensions"] = access_dimensions
-        _save_config(config)
-        return f"Access dimension '{dimension_name}' configured successfully."
 
-    elif operation == "remove":
-        if not dimension_name:
-            return "Error: dimension_name required for 'remove' operation"
-        if dimension_name not in access_dimensions:
-            return f"Dimension '{dimension_name}' not found."
-        del access_dimensions[dimension_name]
-        config["access_dimensions"] = access_dimensions
-        _save_config(config)
-        return f"Access dimension '{dimension_name}' removed."
+    elif rule_type == "role_based":
+        if not allowed_roles:
+            return "Error: allowed_roles required for 'role_based' rule"
+
+        try:
+            roles = json.loads(allowed_roles)
+        except:
+            return "Error: allowed_roles must be valid JSON array"
+
+        restricted_columns[column_name] = {
+            "type": "role_based",
+            "allowed_roles": roles,
+            "role_field": role_field
+        }
 
     else:
-        return f"Unknown operation '{operation}'. Use: list, get, set, remove"
+        return f"Error: Unknown rule_type '{rule_type}'. Use 'self_only' or 'role_based'."
+
+    config["restricted_columns"] = restricted_columns
+    _save_config(config)
+
+    return f"Restriction set on '{column_name}': {rule_type}"
+
+
+@mcp.tool()
+def list_restrictions() -> str:
+    """List all configured column restrictions."""
+    config = _get_config()
+    restricted_columns = config.get("restricted_columns", {})
+
+    if not restricted_columns:
+        return "No column restrictions configured."
+
+    output = ["Configured column restrictions:"]
+    for column, rule in restricted_columns.items():
+        output.append(f"\n{column}:")
+        output.append(f"  Type: {rule['type']}")
+        if rule['type'] == 'self_only':
+            output.append(f"  User ID column: {rule['user_id_column']}")
+            output.append(f"  User ID field: {rule.get('user_id_field', 'id')}")
+        elif rule['type'] == 'role_based':
+            output.append(f"  Allowed roles: {rule['allowed_roles']}")
+            output.append(f"  Role field: {rule.get('role_field', 'role')}")
+
+    return "\n".join(output)
+
+
+@mcp.tool()
+def remove_restriction(column_name: str) -> str:
+    """
+    Remove access control restriction from a column.
+
+    Args:
+        column_name: The column to unrestrict
+    """
+    config = _get_config()
+    restricted_columns = config.get("restricted_columns", {})
+
+    if column_name not in restricted_columns:
+        return f"No restriction found for '{column_name}'."
+
+    del restricted_columns[column_name]
+    config["restricted_columns"] = restricted_columns
+    _save_config(config)
+
+    return f"Restriction removed from '{column_name}'."
 
 
 @mcp.tool()
@@ -503,7 +629,6 @@ def manage_identity(
             result = client.query(query).result()
             users = [dict(row) for row in result]
 
-            # Find user by any field value
             for user in users:
                 for key, value in user.items():
                     if str(value).lower() == user_identifier.lower():
@@ -530,14 +655,12 @@ def configure_dataset(dataset: str = None, users_table: str = None) -> str:
     config = _get_config()
 
     if dataset is None and users_table is None:
-        # Show current config
         output = ["Current configuration:"]
         output.append(f"  Dataset: {config.get('dataset', 'NOT SET')}")
         output.append(f"  Users table: {config.get('users_table', 'NOT SET')}")
         return "\n".join(output)
 
     if dataset:
-        # Validate dataset exists
         try:
             schema = _load_schema(dataset)
             if "error" in schema:
@@ -545,7 +668,6 @@ def configure_dataset(dataset: str = None, users_table: str = None) -> str:
             config["dataset"] = dataset
             _save_config(config)
 
-            # Update context file with schema
             schema_str = f"# Schema for {dataset}\n\n"
             for table, info in schema.items():
                 schema_str += f"## {table}\n"

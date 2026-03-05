@@ -1,45 +1,42 @@
-# Text-to-SQL Agent with Access Control
+# Text-to-SQL Agent with Column-Level Access Control
 
-An MCP server that provides natural language to SQL capabilities with role-based access control. Built as a learning project to explore agentic patterns with Claude.
+An MCP server that provides natural language to SQL capabilities with column-level access control. Built as a learning project to explore agentic patterns with Claude.
 
 ## What it does
 
 - Converts natural language questions to BigQuery SQL
-- Enforces row-level access control based on user attributes
+- Enforces column-level access control using an enforcer LLM
 - Can run standalone or as an MCP server for Claude Desktop/other agents
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  MCP Client (Claude Desktop, Cursor, custom agent)     │
-└─────────────────────┬───────────────────────────────────┘
+User Input
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Main LLM (generates SQL from natural language)             │
+└─────────────────────┬───────────────────────────────────────┘
                       │
                       ▼
-┌─────────────────────────────────────────────────────────┐
-│  MCP Server (server.py)                                 │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │ Tools:                                           │   │
-│  │  • read_context / write_context (scratchpad)    │   │
-│  │  • run_query (with access control)              │   │
-│  │  • preview_query (verify access control)        │   │
-│  │  • manage_access_rules                          │   │
-│  │  • manage_identity                              │   │
-│  │  • configure_dataset                            │   │
-│  └─────────────────────────────────────────────────┘   │
-│                         │                               │
-│                         ▼                               │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │ Access Control Layer                             │   │
-│  │  • Injects WHERE clauses based on user attrs    │   │
-│  │  • Follows FK relationships                     │   │
-│  └─────────────────────────────────────────────────┘   │
-│                         │                               │
-└─────────────────────────┼───────────────────────────────┘
-                          ▼
-                    ┌───────────┐
-                    │ BigQuery  │
-                    └───────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Access Control Check                                        │
+│  • Does SQL contain any restricted column names?            │
+│  • If NO → execute directly                                 │
+│  • If YES → pass to enforcer                                │
+└─────────────────────┬───────────────────────────────────────┘
+                      │ (only if restricted columns detected)
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Enforcer LLM (rewrites SQL)                                │
+│  • Only sees: SQL + rule (e.g., "add WHERE employee_id=X")  │
+│  • Never sees: user input (prevents prompt injection)       │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ▼
+                ┌───────────┐
+                │ BigQuery  │
+                └───────────┘
 ```
 
 ## Setup
@@ -71,10 +68,10 @@ python cli.py chat
 ```
 
 Talk naturally:
-- "users are in the sales_people table"
-- "set up geography access control"
+- "users are in the employees table"
+- "restrict salary to self-only access"
 - "test as John Smith"
-- "what are total sales by region?"
+- "what is the average salary?" (will be filtered to John's own data)
 
 ### As MCP Server (for Claude Desktop)
 
@@ -93,40 +90,77 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ## Access Control Example
 
 ```
-# As Admin - see all 100,000 customers
-[Admin]> how many customers?
-→ 100,000
+# Admin sets up restriction
+[Admin]> restrict salary so users can only see their own
+→ Setting up restriction on employees.salary (self_only)
+→ User ID column: employee_id
 
-# Switch to US-only user
+# Admin sees everything
+[Admin]> what are all salaries?
+→ Returns all employee salaries
+
+# Switch to regular user
 [Admin]> test as John Smith
-Now simulating: John Smith (geography: US)
+→ Now simulating: John Smith (id: 42)
 
-# Same query - automatically filtered
-[John Smith]> how many customers?
-→ 22,482 (US only)
+# Same query - enforcer rewrites SQL
+[John Smith]> what are all salaries?
+→ [Access control applied: salary restricted to employee_id='42']
+→ Returns only John's salary
 ```
 
-## Limitations
+## How Column-Level Access Control Works
 
-This is a **prototype for learning**, not production-ready:
+1. **Admin describes what to restrict** in plain English (e.g., "salary data")
+2. **Claude suggests matching columns** from the schema
+3. **Admin picks exact columns** to restrict
+4. **Detection**: Exact string match of column name in SQL
+5. **Enforcement**: Enforcer LLM rewrites SQL (only sees SQL + rule, never user input)
 
-- Access control uses regex-based SQL injection (fragile)
-- No proper SQL parsing (breaks on complex queries)
-- No query validation before execution
+### Rule Types
 
-For production, consider:
-- SQL parser like `sqlglot`
-- BigQuery row-level security policies
-- Views per role
+- **self_only**: Users can only see their own data
+  - Requires: `user_id_column` (which column identifies the owner)
+
+- **role_based**: Only certain roles can access
+  - Requires: `allowed_roles` (list of permitted roles)
+
+## Tools Available
+
+| Tool | Purpose |
+|------|---------|
+| `read_context` | Read schema/examples scratchpad |
+| `write_context` | Add to scratchpad |
+| `run_query` | Execute SQL with access control |
+| `preview_query` | Preview access control without executing |
+| `suggest_restricted_columns` | Suggest columns matching a description |
+| `set_column_restriction` | Add restriction to a column |
+| `list_restrictions` | Show all restrictions |
+| `remove_restriction` | Remove a restriction |
+| `manage_identity` | Switch simulated user |
+| `configure_dataset` | Set BigQuery dataset |
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `server.py` | MCP server with tools |
+| `server.py` | MCP server with tools + enforcer |
 | `cli.py` | CLI (init, serve, chat) |
-| `config.json` | Access control rules |
+| `config.json` | Column restrictions |
 | `context.md` | Scratchpad for schema/examples |
+
+## Limitations
+
+This is a **prototype for learning**, not production-ready:
+
+- Column detection is simple string matching (could match partial names)
+- Enforcer LLM might make mistakes on complex queries
+- No caching of enforcer rewrites
+
+For production, consider:
+- SQL parser like `sqlglot` for precise column detection
+- BigQuery column-level security policies
+- Views per role
 
 ## License
 
