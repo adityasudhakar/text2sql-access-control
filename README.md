@@ -62,10 +62,12 @@ User Input
 
 ## Usage
 
-### Standalone Chat Mode
+### Standalone Chat Mode (Requires Claude Code)
 ```bash
 python cli.py chat
 ```
+
+**Note:** Chat mode uses the [Claude Agent SDK](https://docs.anthropic.com/en/docs/agents-and-tools/claude-agent-sdk) which requires [Claude Code](https://claude.com/code) to be installed.
 
 Talk naturally:
 - "users are in the employees table"

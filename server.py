@@ -705,4 +705,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    # Support --mcp flag (for consistency, but always runs as MCP)
+    if len(sys.argv) > 1 and sys.argv[1] == "--mcp":
+        main()
+    else:
+        main()
