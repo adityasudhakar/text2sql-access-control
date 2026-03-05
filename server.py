@@ -2,16 +2,20 @@
 Text-to-SQL MCP Server with Column-Level Access Control
 
 An MCP server that provides text-to-SQL capabilities with column-level access control.
-Uses an enforcer LLM to rewrite SQL when sensitive columns are detected.
+Uses sqlglot for SQL parsing and deterministic join-based enforcement.
 """
 
 import os
 import json
 from typing import Any
+from collections import defaultdict
 from google.cloud import bigquery
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+import sqlglot
+from sqlglot import exp
+from sqlglot.optimizer.scope import build_scope
 
 # Load environment
 load_dotenv()
@@ -32,6 +36,7 @@ _bq_client = None
 _config = None
 _current_identity = None
 _anthropic_client = None
+_schema_cache = None
 
 
 def _get_anthropic() -> Anthropic:
@@ -76,6 +81,10 @@ def _get_bq_client() -> bigquery.Client:
 
 def _load_schema(dataset: str) -> dict:
     """Load schema from BigQuery dataset"""
+    global _schema_cache
+    if _schema_cache is not None:
+        return _schema_cache
+
     client = _get_bq_client()
     schema = {}
     try:
@@ -86,6 +95,7 @@ def _load_schema(dataset: str) -> dict:
             schema[table.table_id] = {
                 "columns": [{"name": f.name, "type": f.field_type} for f in table_ref.schema]
             }
+        _schema_cache = schema
     except Exception as e:
         return {"error": str(e)}
     return schema
@@ -108,117 +118,189 @@ def _get_all_columns(dataset: str) -> list:
     return columns
 
 
+# ============================================
+# FK Detection and Path Finding
+# ============================================
+
+def _detect_foreign_keys(schema: dict) -> list:
+    """
+    Detect likely foreign key relationships by naming convention.
+    Returns list of {"from_table": t1, "from_column": c1, "to_table": t2, "to_column": c2}
+    """
+    fks = []
+
+    # Build column lookup: column_name -> list of tables that have it
+    column_tables = defaultdict(list)
+    for table_name, table_info in schema.items():
+        for col in table_info["columns"]:
+            column_tables[col["name"].lower()].append(table_name)
+
+    # Find columns that appear in multiple tables (likely FKs)
+    for col_name, tables in column_tables.items():
+        if len(tables) > 1:
+            # Assume the column links these tables
+            for i, t1 in enumerate(tables):
+                for t2 in tables[i+1:]:
+                    fks.append({
+                        "from_table": t1,
+                        "from_column": col_name,
+                        "to_table": t2,
+                        "to_column": col_name
+                    })
+
+    # Also look for patterns like "user_id" -> "users.id"
+    for table_name, table_info in schema.items():
+        for col in table_info["columns"]:
+            col_lower = col["name"].lower()
+            # Pattern: {table}_id or {table}id
+            for other_table in schema.keys():
+                other_lower = other_table.lower()
+                # Check if column is like "users_id" or "user_id" for table "users"
+                if col_lower == f"{other_lower}_id" or col_lower == f"{other_lower[:-1]}_id" if other_lower.endswith('s') else False:
+                    # Check if other table has "id" column
+                    other_cols = [c["name"].lower() for c in schema[other_table]["columns"]]
+                    if "id" in other_cols:
+                        fks.append({
+                            "from_table": table_name,
+                            "from_column": col["name"],
+                            "to_table": other_table,
+                            "to_column": "id"
+                        })
+
+    return fks
+
+
+def _find_join_path(schema: dict, fks: list, from_table: str, to_table: str) -> list:
+    """
+    Find shortest path of joins from from_table to to_table using BFS.
+    Returns list of join conditions like ["table1.col = table2.col", ...]
+    """
+    if from_table == to_table:
+        return []
+
+    # Build adjacency list
+    graph = defaultdict(list)
+    for fk in fks:
+        graph[fk["from_table"]].append({
+            "table": fk["to_table"],
+            "join": f"{fk['from_table']}.{fk['from_column']} = {fk['to_table']}.{fk['to_column']}"
+        })
+        graph[fk["to_table"]].append({
+            "table": fk["from_table"],
+            "join": f"{fk['to_table']}.{fk['to_column']} = {fk['from_table']}.{fk['from_column']}"
+        })
+
+    # BFS
+    from collections import deque
+    queue = deque([(from_table, [])])
+    visited = {from_table}
+
+    while queue:
+        current, path = queue.popleft()
+
+        for neighbor in graph[current]:
+            if neighbor["table"] == to_table:
+                return path + [neighbor["join"]]
+
+            if neighbor["table"] not in visited:
+                visited.add(neighbor["table"])
+                queue.append((neighbor["table"], path + [neighbor["join"]]))
+
+    return None  # No path found
+
+
+# ============================================
+# SQL Parsing and Column Detection
+# ============================================
+
+def _extract_columns_from_sql(sql: str, schema: dict) -> list:
+    """
+    Parse SQL and extract all column references as table.column.
+    Resolves aliases to actual table names.
+    """
+    try:
+        parsed = sqlglot.parse_one(sql, dialect='bigquery')
+    except Exception as e:
+        return []
+
+    # Build alias -> table mapping
+    alias_map = {}
+    try:
+        root = build_scope(parsed)
+        if root:
+            for alias, source in root.sources.items():
+                if isinstance(source, exp.Table):
+                    alias_map[alias] = source.name
+    except:
+        pass
+
+    # Also check FROM clause directly for simple cases
+    for table in parsed.find_all(exp.Table):
+        if table.alias:
+            alias_map[table.alias] = table.name
+        else:
+            alias_map[table.name] = table.name
+
+    # Extract all column references
+    columns = []
+    for col in parsed.find_all(exp.Column):
+        col_name = col.name
+        table_ref = col.table if col.table else None
+
+        # Resolve alias to actual table name
+        if table_ref and table_ref in alias_map:
+            actual_table = alias_map[table_ref]
+        elif table_ref:
+            actual_table = table_ref
+        else:
+            # No table specified - try to find which table has this column
+            actual_table = None
+            for table_name, table_info in schema.items():
+                if col_name.lower() in [c["name"].lower() for c in table_info["columns"]]:
+                    actual_table = table_name
+                    break
+
+        if actual_table:
+            columns.append(f"{actual_table}.{col_name}")
+
+    return columns
+
+
 def _check_restricted_columns(sql: str, config: dict) -> list:
     """
-    Check if SQL contains any restricted columns.
+    Check if SQL contains any restricted columns using proper parsing.
     Returns list of matched restrictions.
     """
-    restricted_columns = config.get("restricted_columns", {})
-    matches = []
+    schema = _load_schema(config.get("dataset", ""))
+    if "error" in schema:
+        return []
 
-    sql_lower = sql.lower()
-    for column_name, rule in restricted_columns.items():
-        # Exact match on column name
-        if column_name.lower() in sql_lower:
-            matches.append({
-                "column": column_name,
-                "rule": rule
-            })
+    restrictions = config.get("access_rules", [])
+    if not restrictions:
+        return []
+
+    # Extract columns from SQL
+    sql_columns = _extract_columns_from_sql(sql, schema)
+    sql_columns_lower = [c.lower() for c in sql_columns]
+
+    matches = []
+    for rule in restrictions:
+        restricted_col = rule["restricted_column"].lower()
+        if restricted_col in sql_columns_lower:
+            matches.append(rule)
 
     return matches
 
 
-def _enforcer_rewrite(sql: str, restriction: dict, current_user: dict, config: dict) -> dict:
-    """
-    Use enforcer LLM to rewrite SQL with access control.
-    The enforcer only sees the SQL and the rule - no user input.
-    """
-    column = restriction["column"]
-    rule = restriction["rule"]
-
-    # Build the enforcement instruction
-    if rule["type"] == "self_only":
-        user_id_column = rule["user_id_column"]
-        user_id_value = current_user.get(rule.get("user_id_field", "id"))
-
-        if user_id_value is None:
-            return {
-                "success": False,
-                "error": f"Cannot determine user ID for access control",
-                "sql": sql
-            }
-
-        instruction = f"""Rewrite this SQL to add an access control filter.
-
-RULE: The column '{column}' is restricted. Users can only see their own data.
-FILTER TO ADD: {user_id_column} = '{user_id_value}'
-
-Original SQL:
-{sql}
-
-Requirements:
-1. Add a WHERE clause (or AND condition) to filter by {user_id_column} = '{user_id_value}'
-2. Keep the query logic otherwise identical
-3. Return ONLY the modified SQL, no explanations
-
-Modified SQL:"""
-
-    elif rule["type"] == "role_based":
-        allowed_roles = rule.get("allowed_roles", [])
-        user_role = current_user.get(rule.get("role_field", "role"))
-
-        if user_role not in allowed_roles:
-            return {
-                "success": False,
-                "error": f"Access denied: role '{user_role}' cannot access '{column}'",
-                "sql": sql
-            }
-        # Role is allowed, no rewrite needed
-        return {"success": True, "sql": sql, "rules_applied": []}
-
-    else:
-        return {
-            "success": False,
-            "error": f"Unknown rule type: {rule['type']}",
-            "sql": sql
-        }
-
-    # Call enforcer LLM
-    try:
-        client = _get_anthropic()
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": instruction}]
-        )
-
-        modified_sql = response.content[0].text.strip()
-        # Clean up any markdown
-        if modified_sql.startswith("```"):
-            modified_sql = modified_sql.split("\n", 1)[1]
-        if modified_sql.endswith("```"):
-            modified_sql = modified_sql.rsplit("```", 1)[0]
-        modified_sql = modified_sql.strip()
-
-        return {
-            "success": True,
-            "sql": modified_sql,
-            "original_sql": sql,
-            "rules_applied": [f"{column}: restricted to {user_id_column}='{user_id_value}'"]
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Enforcer error: {e}",
-            "sql": sql
-        }
-
+# ============================================
+# Deterministic SQL Rewriting
+# ============================================
 
 def _apply_access_control(sql: str, user: dict, config: dict) -> dict:
     """
-    Apply column-level access control to SQL query.
-    1. Check if SQL contains any restricted columns
-    2. If yes, use enforcer LLM to rewrite
+    Apply column-level access control to SQL query deterministically.
+    1. Parse SQL to find restricted columns
+    2. Add necessary JOINs and WHERE clauses
     """
     if user is None:
         # Admin mode - no restrictions
@@ -230,28 +312,86 @@ def _apply_access_control(sql: str, user: dict, config: dict) -> dict:
     if not matches:
         return {"sql": sql, "rules_applied": [], "access_restricted": False}
 
-    # Apply each restriction via enforcer
-    current_sql = sql
-    all_rules_applied = []
+    schema = _load_schema(config.get("dataset", ""))
+    fks = config.get("foreign_keys", [])
+    if not fks:
+        fks = _detect_foreign_keys(schema)
 
-    for match in matches:
-        result = _enforcer_rewrite(current_sql, match, user, config)
+    # Parse the SQL
+    try:
+        parsed = sqlglot.parse_one(sql, dialect='bigquery')
+    except Exception as e:
+        return {"sql": sql, "error": f"Could not parse SQL: {e}", "access_denied": True}
 
-        if not result["success"]:
+    rules_applied = []
+
+    for rule in matches:
+        restricted_col = rule["restricted_column"]
+        user_identifier_col = rule["user_identifier_column"]  # e.g., "account_execs.ae_email"
+
+        # Get user's value for the identifier
+        user_field = rule.get("user_field", user_identifier_col.split(".")[-1])
+        user_value = user.get(user_field)
+
+        if user_value is None:
             return {
                 "sql": sql,
-                "error": result["error"],
+                "error": f"User missing required field '{user_field}' for access control",
                 "access_denied": True
             }
 
-        current_sql = result["sql"]
-        all_rules_applied.extend(result.get("rules_applied", []))
+        # Get table names
+        restricted_table = restricted_col.split(".")[0]
+        identifier_table = user_identifier_col.split(".")[0]
+        identifier_column = user_identifier_col.split(".")[1]
+
+        # Find join path from restricted table to identifier table
+        join_path = rule.get("join_path")
+        if not join_path:
+            join_path = _find_join_path(schema, fks, restricted_table, identifier_table)
+
+        if join_path is None:
+            return {
+                "sql": sql,
+                "error": f"No join path found from '{restricted_table}' to '{identifier_table}'",
+                "access_denied": True
+            }
+
+        # Add JOINs to the query
+        for join_cond in join_path:
+            # Parse the join condition to get the table to join
+            parts = join_cond.split(" = ")
+            left_table = parts[0].split(".")[0]
+            right_table = parts[1].split(".")[0]
+
+            # Determine which table we need to add
+            existing_tables = [t.name for t in parsed.find_all(exp.Table)]
+
+            if right_table not in existing_tables:
+                join_table = right_table
+            elif left_table not in existing_tables:
+                join_table = left_table
+            else:
+                continue  # Both tables already in query
+
+            # Add JOIN using Select.join() method
+            parsed = parsed.join(
+                join_table,
+                on=join_cond,
+                join_type="INNER"
+            )
+
+        # Add WHERE condition using Select.where() method
+        where_condition = f"{identifier_table}.{identifier_column} = '{user_value}'"
+        parsed = parsed.where(where_condition, append=True)
+
+        rules_applied.append(f"{restricted_col} filtered by {user_identifier_col}='{user_value}'")
 
     return {
-        "sql": current_sql,
+        "sql": parsed.sql(dialect='bigquery'),
         "original_sql": sql,
-        "rules_applied": all_rules_applied,
-        "access_restricted": bool(all_rules_applied)
+        "rules_applied": rules_applied,
+        "access_restricted": True
     }
 
 
@@ -320,8 +460,7 @@ def write_context(content: str, section: str = "notes") -> str:
 def run_query(sql: str) -> str:
     """
     Execute a SQL query against BigQuery with access control applied.
-    If the query touches restricted columns, it will be automatically rewritten
-    by the enforcer to apply access control rules.
+    If the query touches restricted columns, JOINs and WHERE clauses are added automatically.
 
     Args:
         sql: The SQL query to execute
@@ -393,8 +532,7 @@ def preview_query(sql: str) -> str:
     output.append("")
 
     if _current_identity:
-        output.append(f"Current user: {_current_identity.get('name', 'Unknown')}")
-        output.append(f"User attributes: {json.dumps(_current_identity)}")
+        output.append(f"Current user: {json.dumps(_current_identity)}")
     else:
         output.append("Current user: Admin (no restrictions)")
 
@@ -416,13 +554,10 @@ def preview_query(sql: str) -> str:
 
 
 @mcp.tool()
-def suggest_restricted_columns(description: str) -> str:
+def list_schema_columns() -> str:
     """
-    Given a natural language description of what should be restricted,
-    suggest matching columns from the schema.
-
-    Args:
-        description: Natural language description like "salary data" or "personal information"
+    List all tables and columns in the configured dataset.
+    Use this to help admin select columns for access control.
     """
     config = _get_config()
     dataset = config.get("dataset")
@@ -430,145 +565,205 @@ def suggest_restricted_columns(description: str) -> str:
     if not dataset:
         return "Error: No dataset configured."
 
-    columns = _get_all_columns(dataset)
-    if not columns:
-        return "Error: Could not load schema."
+    schema = _load_schema(dataset)
+    if "error" in schema:
+        return f"Error loading schema: {schema['error']}"
 
-    # Format columns for Claude
-    columns_str = "\n".join([f"- {c['full_name']} ({c['type']})" for c in columns])
-
-    prompt = f"""Given this description of sensitive data: "{description}"
-
-And these available columns:
-{columns_str}
-
-Which columns match what the user wants to restrict?
-Return a JSON array of column names that match, e.g.: ["employees.salary", "employees.ssn"]
-Only include exact column names from the list above.
-Return ONLY the JSON array, no explanation."""
-
-    try:
-        client = _get_anthropic()
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=500,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        result = response.content[0].text.strip()
-        # Parse to validate
-        suggested = json.loads(result)
-
-        output = [f"Based on '{description}', these columns might be sensitive:"]
-        for col in suggested:
-            output.append(f"  - {col}")
-        output.append("")
-        output.append("To restrict a column, use: set_column_restriction")
-
-        return "\n".join(output)
-    except Exception as e:
-        return f"Error: {e}"
-
-
-@mcp.tool()
-def set_column_restriction(
-    column_name: str,
-    rule_type: str,
-    user_id_column: str = None,
-    user_id_field: str = "id",
-    allowed_roles: str = None,
-    role_field: str = "role"
-) -> str:
-    """
-    Set access control restriction on a specific column.
-
-    Args:
-        column_name: The column to restrict (e.g., "employees.salary")
-        rule_type: Either "self_only" (users see own data) or "role_based" (only certain roles)
-        user_id_column: For self_only: which column identifies the user (e.g., "employee_id")
-        user_id_field: For self_only: which field in user record has their ID (default: "id")
-        allowed_roles: For role_based: JSON array of allowed roles (e.g., '["admin", "hr"]')
-        role_field: For role_based: which field in user record has their role (default: "role")
-    """
-    config = _get_config()
-    restricted_columns = config.get("restricted_columns", {})
-
-    if rule_type == "self_only":
-        if not user_id_column:
-            return "Error: user_id_column required for 'self_only' rule"
-
-        restricted_columns[column_name] = {
-            "type": "self_only",
-            "user_id_column": user_id_column,
-            "user_id_field": user_id_field
-        }
-
-    elif rule_type == "role_based":
-        if not allowed_roles:
-            return "Error: allowed_roles required for 'role_based' rule"
-
-        try:
-            roles = json.loads(allowed_roles)
-        except:
-            return "Error: allowed_roles must be valid JSON array"
-
-        restricted_columns[column_name] = {
-            "type": "role_based",
-            "allowed_roles": roles,
-            "role_field": role_field
-        }
-
-    else:
-        return f"Error: Unknown rule_type '{rule_type}'. Use 'self_only' or 'role_based'."
-
-    config["restricted_columns"] = restricted_columns
-    _save_config(config)
-
-    return f"Restriction set on '{column_name}': {rule_type}"
-
-
-@mcp.tool()
-def list_restrictions() -> str:
-    """List all configured column restrictions."""
-    config = _get_config()
-    restricted_columns = config.get("restricted_columns", {})
-
-    if not restricted_columns:
-        return "No column restrictions configured."
-
-    output = ["Configured column restrictions:"]
-    for column, rule in restricted_columns.items():
-        output.append(f"\n{column}:")
-        output.append(f"  Type: {rule['type']}")
-        if rule['type'] == 'self_only':
-            output.append(f"  User ID column: {rule['user_id_column']}")
-            output.append(f"  User ID field: {rule.get('user_id_field', 'id')}")
-        elif rule['type'] == 'role_based':
-            output.append(f"  Allowed roles: {rule['allowed_roles']}")
-            output.append(f"  Role field: {rule.get('role_field', 'role')}")
+    output = ["Available tables and columns:"]
+    for table_name, table_info in schema.items():
+        output.append(f"\n{table_name}:")
+        for col in table_info["columns"]:
+            output.append(f"  - {col['name']} ({col['type']})")
 
     return "\n".join(output)
 
 
 @mcp.tool()
-def remove_restriction(column_name: str) -> str:
+def detect_foreign_keys() -> str:
     """
-    Remove access control restriction from a column.
-
-    Args:
-        column_name: The column to unrestrict
+    Detect likely foreign key relationships in the schema by naming convention.
+    Returns detected FK relationships that can be used for join paths.
     """
     config = _get_config()
-    restricted_columns = config.get("restricted_columns", {})
+    dataset = config.get("dataset")
 
-    if column_name not in restricted_columns:
-        return f"No restriction found for '{column_name}'."
+    if not dataset:
+        return "Error: No dataset configured."
 
-    del restricted_columns[column_name]
-    config["restricted_columns"] = restricted_columns
+    schema = _load_schema(dataset)
+    if "error" in schema:
+        return f"Error loading schema: {schema['error']}"
+
+    fks = _detect_foreign_keys(schema)
+
+    if not fks:
+        return "No foreign key relationships detected by naming convention."
+
+    output = ["Detected foreign key relationships:"]
+    for fk in fks:
+        output.append(f"  {fk['from_table']}.{fk['from_column']} -> {fk['to_table']}.{fk['to_column']}")
+
+    output.append("\nThese will be used automatically for join paths.")
+    output.append("Use set_foreign_key to add or override relationships.")
+
+    return "\n".join(output)
+
+
+@mcp.tool()
+def set_foreign_key(from_table: str, from_column: str, to_table: str, to_column: str) -> str:
+    """
+    Manually set a foreign key relationship for join path resolution.
+
+    Args:
+        from_table: Source table name
+        from_column: Source column name
+        to_table: Target table name
+        to_column: Target column name
+    """
+    config = _get_config()
+    fks = config.get("foreign_keys", [])
+
+    fk = {
+        "from_table": from_table,
+        "from_column": from_column,
+        "to_table": to_table,
+        "to_column": to_column
+    }
+
+    # Check if this FK already exists
+    for existing in fks:
+        if (existing["from_table"] == from_table and
+            existing["from_column"] == from_column and
+            existing["to_table"] == to_table):
+            existing["to_column"] = to_column
+            config["foreign_keys"] = fks
+            _save_config(config)
+            return f"Updated FK: {from_table}.{from_column} -> {to_table}.{to_column}"
+
+    fks.append(fk)
+    config["foreign_keys"] = fks
     _save_config(config)
 
-    return f"Restriction removed from '{column_name}'."
+    return f"Added FK: {from_table}.{from_column} -> {to_table}.{to_column}"
+
+
+@mcp.tool()
+def set_access_rule(
+    restricted_column: str,
+    user_identifier_column: str,
+    user_field: str = None,
+    join_path: str = None
+) -> str:
+    """
+    Set an access control rule: restrict a column based on user identity.
+
+    Args:
+        restricted_column: Column to restrict, e.g., "sales.amount"
+        user_identifier_column: Column that identifies allowed users, e.g., "account_execs.ae_email"
+        user_field: Field in user record to match (defaults to last part of user_identifier_column)
+        join_path: Optional JSON array of join conditions (auto-detected if not provided)
+    """
+    config = _get_config()
+    schema = _load_schema(config.get("dataset", ""))
+
+    if "error" in schema:
+        return f"Error loading schema: {schema['error']}"
+
+    # Validate restricted column exists
+    r_table, r_col = restricted_column.split(".")
+    if r_table not in schema:
+        return f"Error: Table '{r_table}' not found"
+    if r_col not in [c["name"] for c in schema[r_table]["columns"]]:
+        return f"Error: Column '{r_col}' not found in table '{r_table}'"
+
+    # Validate user identifier column exists
+    u_table, u_col = user_identifier_column.split(".")
+    if u_table not in schema:
+        return f"Error: Table '{u_table}' not found"
+    if u_col not in [c["name"] for c in schema[u_table]["columns"]]:
+        return f"Error: Column '{u_col}' not found in table '{u_table}'"
+
+    # Parse join path if provided
+    parsed_join_path = None
+    if join_path:
+        try:
+            parsed_join_path = json.loads(join_path)
+        except:
+            return "Error: join_path must be a valid JSON array"
+
+    # Auto-detect join path if not provided
+    if not parsed_join_path:
+        fks = config.get("foreign_keys", [])
+        if not fks:
+            fks = _detect_foreign_keys(schema)
+        parsed_join_path = _find_join_path(schema, fks, r_table, u_table)
+
+        if parsed_join_path is None:
+            return f"Error: No join path found from '{r_table}' to '{u_table}'. Use set_foreign_key to define relationships."
+
+    rule = {
+        "restricted_column": restricted_column,
+        "user_identifier_column": user_identifier_column,
+        "user_field": user_field or u_col,
+        "join_path": parsed_join_path
+    }
+
+    rules = config.get("access_rules", [])
+
+    # Replace existing rule for same column
+    rules = [r for r in rules if r["restricted_column"] != restricted_column]
+    rules.append(rule)
+
+    config["access_rules"] = rules
+    _save_config(config)
+
+    output = [f"Access rule set for '{restricted_column}':"]
+    output.append(f"  Controlled by: {user_identifier_column}")
+    output.append(f"  User field: {rule['user_field']}")
+    output.append(f"  Join path: {' -> '.join(parsed_join_path) if parsed_join_path else 'direct'}")
+
+    return "\n".join(output)
+
+
+@mcp.tool()
+def list_access_rules() -> str:
+    """List all configured access control rules."""
+    config = _get_config()
+    rules = config.get("access_rules", [])
+
+    if not rules:
+        return "No access rules configured."
+
+    output = ["Configured access rules:"]
+    for rule in rules:
+        output.append(f"\n{rule['restricted_column']}:")
+        output.append(f"  Controlled by: {rule['user_identifier_column']}")
+        output.append(f"  User field: {rule['user_field']}")
+        output.append(f"  Join path: {' -> '.join(rule.get('join_path', []))}")
+
+    return "\n".join(output)
+
+
+@mcp.tool()
+def remove_access_rule(restricted_column: str) -> str:
+    """
+    Remove an access control rule.
+
+    Args:
+        restricted_column: The column to remove restriction from
+    """
+    config = _get_config()
+    rules = config.get("access_rules", [])
+
+    new_rules = [r for r in rules if r["restricted_column"] != restricted_column]
+
+    if len(new_rules) == len(rules):
+        return f"No rule found for '{restricted_column}'."
+
+    config["access_rules"] = new_rules
+    _save_config(config)
+
+    return f"Removed access rule for '{restricted_column}'."
 
 
 @mcp.tool()
@@ -655,6 +850,7 @@ def configure_dataset(dataset: str = None, users_table: str = None) -> str:
         dataset: BigQuery dataset in format 'project.dataset' (optional, shows current if not provided)
         users_table: Name of the table containing user information (optional)
     """
+    global _schema_cache
     config = _get_config()
 
     if dataset is None and users_table is None:
@@ -664,6 +860,7 @@ def configure_dataset(dataset: str = None, users_table: str = None) -> str:
         return "\n".join(output)
 
     if dataset:
+        _schema_cache = None  # Clear cache
         try:
             schema = _load_schema(dataset)
             if "error" in schema:
