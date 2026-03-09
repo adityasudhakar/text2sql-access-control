@@ -55,8 +55,12 @@ def _get_config() -> dict:
     global _config
     if _config is None:
         if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                _config = json.load(f)
+            try:
+                with open(CONFIG_FILE, "r") as f:
+                    content = f.read().strip()
+                    _config = json.loads(content) if content else {}
+            except (json.JSONDecodeError, ValueError):
+                _config = {}
         else:
             _config = {}
     return _config

@@ -87,7 +87,7 @@ def cmd_chat():
     """Run standalone interactive chat mode using Agent SDK with MCP server"""
     import asyncio
     from dotenv import load_dotenv
-    from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage, AssistantMessage, SystemMessage, TaskProgressMessage
+    from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ResultMessage, AssistantMessage, TextBlock, ToolUseBlock
 
     # Load .env file if present
     load_dotenv()
@@ -118,15 +118,16 @@ def cmd_chat():
     if os.path.exists(config_file):
         try:
             with open(config_file, "r") as f:
-                config = json.load(f) or {}
-        except json.JSONDecodeError:
+                content = f.read().strip()
+                config = json.loads(content) if content else {}
+        except (json.JSONDecodeError, ValueError):
             config = {}
     if config.get("dataset"):
         print(f"\nDataset: {config['dataset']}")
         if config.get("users_table"):
             print(f"Users table: {config['users_table']}")
-        if config.get("restricted_columns"):
-            print(f"Restricted columns: {', '.join(config['restricted_columns'].keys())}")
+        if config.get("access_rules"):
+            print(f"Access rules: {len(config['access_rules'])} configured")
     else:
         print("\nNo dataset configured. Say 'configure dataset project.dataset'")
 
@@ -136,7 +137,7 @@ def cmd_chat():
     print("  'restrict salary to self-only access'")
     print("  'test as Alex Brown'")
     print("  'what are total sales?'")
-    print("  'exit' to quit")
+    print("  'exit' to quit, 'new' for fresh session")
     print()
 
     # System prompt for the agent
@@ -161,13 +162,8 @@ LEARNING & CONTEXT:
 - This helps you learn patterns for this specific dataset
 """
 
-    # Session state for conversation persistence
-    session_id = None
-
-    async def run_query_async(user_input: str, resume_session: str = None):
-        """Run a single query through the Agent SDK"""
-        nonlocal session_id
-
+    async def run_chat_session():
+        """Run the chat session with persistent client"""
         options = ClaudeAgentOptions(
             mcp_servers={
                 "text2sql": {
@@ -184,51 +180,54 @@ LEARNING & CONTEXT:
             system_prompt=system_prompt,
         )
 
-        # Resume previous session if we have one
-        if resume_session:
-            options.resume = resume_session
+        async with ClaudeSDKClient(options=options) as client:
+            while True:
+                try:
+                    user_input = input("[Admin]> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nGoodbye!")
+                    break
 
-        async for message in query(prompt=user_input, options=options):
-            if isinstance(message, SystemMessage):
-                # Capture session ID for future queries
-                if hasattr(message, 'session_id') and message.session_id:
-                    session_id = message.session_id
-            elif isinstance(message, TaskProgressMessage):
-                # Tool use progress - show tool name briefly
-                if hasattr(message, 'tool_name'):
-                    tool_name = message.tool_name.replace('mcp__text2sql__', '')
-                    print(f"  [{tool_name}]", end="", flush=True)
-            elif isinstance(message, ResultMessage):
-                # Final result - this is the only place we print the response
-                if message.subtype == "success":
-                    if hasattr(message, 'result') and message.result:
-                        print(f"\n{message.result}")
-                elif message.subtype == "error":
-                    print(f"\nError: {getattr(message, 'error', 'Unknown error')}")
+                if not user_input:
+                    continue
 
-    # Main chat loop
+                if user_input.lower() == "exit":
+                    print("Goodbye!")
+                    break
+
+                if user_input.lower() == "new":
+                    print("Starting fresh session...")
+                    # Exit this session; outer loop will restart
+                    return "restart"
+
+                # Send query and get response
+                await client.query(user_input)
+
+                # Process response messages
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                print(block.text)
+                            elif isinstance(block, ToolUseBlock):
+                                tool_name = block.name.replace('mcp__text2sql__', '')
+                                print(f"  [{tool_name}]", end="", flush=True)
+                    elif isinstance(message, ResultMessage):
+                        if message.subtype == "success":
+                            if hasattr(message, 'result') and message.result:
+                                print(f"\n{message.result}")
+                        elif message.subtype == "error":
+                            print(f"\nError: {getattr(message, 'error', 'Unknown error')}")
+
+                print()
+
+        return "exit"
+
+    # Main loop - allows restarting sessions
     while True:
-        try:
-            user_input = input("[Admin]> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!")
+        result = asyncio.run(run_chat_session())
+        if result != "restart":
             break
-
-        if not user_input:
-            continue
-
-        if user_input.lower() == "exit":
-            print("Goodbye!")
-            break
-
-        if user_input.lower() == "new":
-            session_id = None
-            print("Started new session.")
-            continue
-
-        # Run the query through Agent SDK, resuming session if available
-        asyncio.run(run_query_async(user_input, resume_session=session_id))
-        print()
 
 
 def main():
