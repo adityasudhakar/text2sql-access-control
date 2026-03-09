@@ -122,6 +122,40 @@ def _get_all_columns(dataset: str) -> list:
 # FK Detection and Path Finding
 # ============================================
 
+def _validate_join_condition(join_cond: str) -> tuple:
+    """
+    Validate that a join condition matches expected format: "table.column = table.column"
+    Returns (is_valid, error_message)
+    """
+    if not isinstance(join_cond, str):
+        return (False, f"Join condition must be a string, got: {type(join_cond).__name__}")
+
+    if " = " not in join_cond:
+        return (False, f"Join condition must contain ' = ', got: '{join_cond}'")
+
+    parts = join_cond.split(" = ")
+    if len(parts) != 2:
+        return (False, f"Join condition must have exactly one ' = ', got: '{join_cond}'")
+
+    left, right = parts[0].strip(), parts[1].strip()
+
+    # Validate left side: table.column
+    if "." not in left:
+        return (False, f"Left side must be 'table.column', got: '{left}'")
+    left_parts = left.split(".")
+    if len(left_parts) != 2 or not left_parts[0] or not left_parts[1]:
+        return (False, f"Left side must be exactly 'table.column', got: '{left}'")
+
+    # Validate right side: table.column
+    if "." not in right:
+        return (False, f"Right side must be 'table.column', got: '{right}'")
+    right_parts = right.split(".")
+    if len(right_parts) != 2 or not right_parts[0] or not right_parts[1]:
+        return (False, f"Right side must be exactly 'table.column', got: '{right}'")
+
+    return (True, None)
+
+
 def _detect_foreign_keys(schema: dict) -> list:
     """
     Detect likely foreign key relationships by naming convention.
@@ -213,15 +247,17 @@ def _find_join_path(schema: dict, fks: list, from_table: str, to_table: str) -> 
 # SQL Parsing and Column Detection
 # ============================================
 
-def _extract_columns_from_sql(sql: str, schema: dict) -> list:
+def _extract_columns_from_sql(sql: str, schema: dict) -> tuple:
     """
     Parse SQL and extract all column references as table.column.
     Resolves aliases to actual table names.
+
+    Returns (columns, error) tuple. If error is not None, parsing failed.
     """
     try:
         parsed = sqlglot.parse_one(sql, dialect='bigquery')
     except Exception as e:
-        return []
+        return (None, f"SQL parse error: {e}")
 
     # Build alias -> table mapping
     alias_map = {}
@@ -231,7 +267,8 @@ def _extract_columns_from_sql(sql: str, schema: dict) -> list:
             for alias, source in root.sources.items():
                 if isinstance(source, exp.Table):
                     alias_map[alias] = source.name
-    except:
+    except Exception as e:
+        # Non-fatal - we can still try to extract columns
         pass
 
     # Also check FROM clause directly for simple cases
@@ -250,37 +287,44 @@ def _extract_columns_from_sql(sql: str, schema: dict) -> list:
         # Resolve alias to actual table name
         if table_ref and table_ref in alias_map:
             actual_table = alias_map[table_ref]
+            columns.append(f"{actual_table}.{col_name}")
         elif table_ref:
-            actual_table = table_ref
+            columns.append(f"{table_ref}.{col_name}")
         else:
-            # No table specified - try to find which table has this column
-            actual_table = None
+            # No table specified - find ALL tables that have this column
+            # This is conservative: if column is ambiguous and ANY match is restricted,
+            # the rule will be applied (fail-closed behavior)
+            matching_tables = []
             for table_name, table_info in schema.items():
                 if col_name.lower() in [c["name"].lower() for c in table_info["columns"]]:
-                    actual_table = table_name
-                    break
+                    matching_tables.append(table_name)
 
-        if actual_table:
-            columns.append(f"{actual_table}.{col_name}")
+            if matching_tables:
+                for table_name in matching_tables:
+                    columns.append(f"{table_name}.{col_name}")
+            # If no matching table found, column might be computed/literal - skip it
 
-    return columns
+    return (columns, None)
 
 
-def _check_restricted_columns(sql: str, config: dict) -> list:
+def _check_restricted_columns(sql: str, config: dict) -> tuple:
     """
     Check if SQL contains any restricted columns using proper parsing.
-    Returns list of matched restrictions.
+    Returns (matches, error) tuple. If error is not None, check failed and query should be denied.
     """
     schema = _load_schema(config.get("dataset", ""))
     if "error" in schema:
-        return []
+        return (None, f"Schema error: {schema['error']}")
 
     restrictions = config.get("access_rules", [])
     if not restrictions:
-        return []
+        return ([], None)  # No rules configured - allow
 
     # Extract columns from SQL
-    sql_columns = _extract_columns_from_sql(sql, schema)
+    sql_columns, parse_error = _extract_columns_from_sql(sql, schema)
+    if parse_error:
+        return (None, parse_error)
+
     sql_columns_lower = [c.lower() for c in sql_columns]
 
     matches = []
@@ -289,25 +333,56 @@ def _check_restricted_columns(sql: str, config: dict) -> list:
         if restricted_col in sql_columns_lower:
             matches.append(rule)
 
-    return matches
+    return (matches, None)
 
 
 # ============================================
 # Deterministic SQL Rewriting
 # ============================================
 
+def _build_column_ref(table: str, column: str) -> exp.Column:
+    """Build an AST-safe column reference."""
+    return exp.Column(this=exp.to_identifier(column), table=exp.to_identifier(table))
+
+
+def _build_eq_condition(left_table: str, left_col: str, right_table: str, right_col: str) -> exp.EQ:
+    """Build an AST-safe equality condition between two columns."""
+    return exp.EQ(
+        this=_build_column_ref(left_table, left_col),
+        expression=_build_column_ref(right_table, right_col)
+    )
+
+
+def _build_literal_eq(table: str, column: str, value: str) -> exp.EQ:
+    """Build an AST-safe equality condition: table.column = 'literal_value'"""
+    return exp.EQ(
+        this=_build_column_ref(table, column),
+        expression=exp.Literal.string(value)
+    )
+
+
 def _apply_access_control(sql: str, user: dict, config: dict) -> dict:
     """
     Apply column-level access control to SQL query deterministically.
     1. Parse SQL to find restricted columns
     2. Add necessary JOINs and WHERE clauses
+
+    FAIL-CLOSED: If parsing or schema lookup fails, query is denied.
     """
     if user is None:
         # Admin mode - no restrictions
         return {"sql": sql, "rules_applied": [], "access_restricted": False}
 
-    # Check for restricted columns
-    matches = _check_restricted_columns(sql, config)
+    # Check for restricted columns (fail-closed on errors)
+    matches, check_error = _check_restricted_columns(sql, config)
+
+    if check_error:
+        # FAIL-CLOSED: deny query if we can't verify it's safe
+        return {
+            "sql": sql,
+            "error": f"Access control check failed: {check_error}",
+            "access_denied": True
+        }
 
     if not matches:
         return {"sql": sql, "rules_applied": [], "access_restricted": False}
@@ -322,6 +397,15 @@ def _apply_access_control(sql: str, user: dict, config: dict) -> dict:
         parsed = sqlglot.parse_one(sql, dialect='bigquery')
     except Exception as e:
         return {"sql": sql, "error": f"Could not parse SQL: {e}", "access_denied": True}
+
+    # Build table name -> alias mapping (and track which tables exist)
+    # If table has alias, we must use alias in references; otherwise use table name
+    table_to_ref = {}  # table_name -> reference to use (alias if exists, else table_name)
+    for table in parsed.find_all(exp.Table):
+        if table.alias:
+            table_to_ref[table.name] = table.alias
+        else:
+            table_to_ref[table.name] = table.name
 
     rules_applied = []
 
@@ -359,31 +443,50 @@ def _apply_access_control(sql: str, user: dict, config: dict) -> dict:
 
         # Add JOINs to the query
         for join_cond in join_path:
-            # Parse the join condition to get the table to join
+            # Parse the join condition to get the tables involved
+            # Format: "table1.col1 = table2.col2"
             parts = join_cond.split(" = ")
             left_table = parts[0].split(".")[0]
+            left_col = parts[0].split(".")[1]
             right_table = parts[1].split(".")[0]
+            right_col = parts[1].split(".")[1]
 
             # Determine which table we need to add
-            existing_tables = [t.name for t in parsed.find_all(exp.Table)]
+            existing_tables = set(table_to_ref.keys())
 
             if right_table not in existing_tables:
                 join_table = right_table
+                # Use alias/ref for existing table, base name for new table
+                left_ref = table_to_ref.get(left_table, left_table)
+                join_on_ast = _build_eq_condition(left_ref, left_col, join_table, right_col)
             elif left_table not in existing_tables:
                 join_table = left_table
+                right_ref = table_to_ref.get(right_table, right_table)
+                join_on_ast = _build_eq_condition(join_table, left_col, right_ref, right_col)
             else:
                 continue  # Both tables already in query
 
-            # Add JOIN using Select.join() method
+            # Add JOIN using Select.join() method with AST expression
+            # Fully qualify the table name with dataset for BigQuery compatibility
+            dataset = config.get("dataset", "")
+            if dataset:
+                full_table_name = f"{dataset}.{join_table}"
+            else:
+                full_table_name = join_table
+
             parsed = parsed.join(
-                join_table,
-                on=join_cond,
+                exp.to_table(full_table_name),
+                on=join_on_ast,
                 join_type="INNER"
             )
+            # Track newly added table (no alias, so ref = table name)
+            table_to_ref[join_table] = join_table
 
-        # Add WHERE condition using Select.where() method
-        where_condition = f"{identifier_table}.{identifier_column} = '{user_value}'"
-        parsed = parsed.where(where_condition, append=True)
+        # Add WHERE condition using AST-safe construction (no string interpolation)
+        # Use the correct reference (alias or table name) for the identifier table
+        identifier_ref = table_to_ref.get(identifier_table, identifier_table)
+        where_ast = _build_literal_eq(identifier_ref, identifier_column, str(user_value))
+        parsed = parsed.where(where_ast, append=True)
 
         rules_applied.append(f"{restricted_col} filtered by {user_identifier_col}='{user_value}'")
 
@@ -669,27 +772,51 @@ def set_access_rule(
     if "error" in schema:
         return f"Error loading schema: {schema['error']}"
 
-    # Validate restricted column exists
-    r_table, r_col = restricted_column.split(".")
+    # Validate restricted_column format
+    if not restricted_column or "." not in restricted_column:
+        return f"Error: restricted_column must be in 'table.column' format, got: '{restricted_column}'"
+    r_parts = restricted_column.split(".")
+    if len(r_parts) != 2:
+        return f"Error: restricted_column must be exactly 'table.column' format, got: '{restricted_column}'"
+    r_table, r_col = r_parts
+
+    # Validate user_identifier_column format
+    if not user_identifier_column or "." not in user_identifier_column:
+        return f"Error: user_identifier_column must be in 'table.column' format, got: '{user_identifier_column}'"
+    u_parts = user_identifier_column.split(".")
+    if len(u_parts) != 2:
+        return f"Error: user_identifier_column must be exactly 'table.column' format, got: '{user_identifier_column}'"
+    u_table, u_col = u_parts
+
+    # Validate restricted column exists in schema
     if r_table not in schema:
-        return f"Error: Table '{r_table}' not found"
+        return f"Error: Table '{r_table}' not found in schema"
     if r_col not in [c["name"] for c in schema[r_table]["columns"]]:
         return f"Error: Column '{r_col}' not found in table '{r_table}'"
 
-    # Validate user identifier column exists
-    u_table, u_col = user_identifier_column.split(".")
+    # Validate user identifier column exists in schema
     if u_table not in schema:
-        return f"Error: Table '{u_table}' not found"
+        return f"Error: Table '{u_table}' not found in schema"
     if u_col not in [c["name"] for c in schema[u_table]["columns"]]:
         return f"Error: Column '{u_col}' not found in table '{u_table}'"
 
-    # Parse join path if provided
+    # Parse and validate join path if provided
     parsed_join_path = None
     if join_path:
         try:
             parsed_join_path = json.loads(join_path)
         except:
             return "Error: join_path must be a valid JSON array"
+
+        # Validate it's a list
+        if not isinstance(parsed_join_path, list):
+            return "Error: join_path must be a JSON array of join conditions"
+
+        # Validate each join condition format
+        for i, join_cond in enumerate(parsed_join_path):
+            is_valid, error = _validate_join_condition(join_cond)
+            if not is_valid:
+                return f"Error in join_path[{i}]: {error}"
 
     # Auto-detect join path if not provided
     if not parsed_join_path:

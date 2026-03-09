@@ -102,9 +102,10 @@ def cmd_chat():
         print("  2. Or create a .env file with: ANTHROPIC_API_KEY=sk-ant-...")
         sys.exit(1)
 
-    # Get the path to server.py
+    # Get the path to server.py (in isolated mcp_server directory)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    server_path = os.path.join(script_dir, "server.py")
+    mcp_server_dir = os.path.join(script_dir, "mcp_server")
+    server_path = os.path.join(mcp_server_dir, "server.py")
 
     print("=" * 60)
     print("  TEXT-TO-SQL WITH ACCESS CONTROL")
@@ -112,20 +113,22 @@ def cmd_chat():
     print("=" * 60)
 
     # Show current config
-    config_file = os.path.join(script_dir, "config.json")
+    config_file = os.path.join(mcp_server_dir, "config.json")
+    config = {}
     if os.path.exists(config_file):
-        with open(config_file, "r") as f:
-            config = json.load(f)
-        if config.get("dataset"):
-            print(f"\nDataset: {config['dataset']}")
-            if config.get("users_table"):
-                print(f"Users table: {config['users_table']}")
-            if config.get("restricted_columns"):
-                print(f"Restricted columns: {', '.join(config['restricted_columns'].keys())}")
-        else:
-            print("\nNo dataset configured. Say 'configure dataset project.dataset'")
+        try:
+            with open(config_file, "r") as f:
+                config = json.load(f) or {}
+        except json.JSONDecodeError:
+            config = {}
+    if config.get("dataset"):
+        print(f"\nDataset: {config['dataset']}")
+        if config.get("users_table"):
+            print(f"Users table: {config['users_table']}")
+        if config.get("restricted_columns"):
+            print(f"Restricted columns: {', '.join(config['restricted_columns'].keys())}")
     else:
-        print("\nNo config found. Say 'configure dataset project.dataset'")
+        print("\nNo dataset configured. Say 'configure dataset project.dataset'")
 
     print("\nTalk to me naturally. Examples:")
     print("  'what tables are available?'")
@@ -141,25 +144,39 @@ def cmd_chat():
 
 When users ask questions:
 - For data questions: Generate SQL and use run_query
-- For admin setup: Use suggest_restricted_columns, then set_column_restriction
-- Check schema first if unsure about table/column names
+- For admin setup: Use set_access_rule to restrict columns, list_access_rules to view, remove_access_rule to delete
+- Use list_schema_columns to see available tables/columns
+- Use detect_foreign_keys to find join relationships
+- Use manage_identity to switch simulated users for testing
 
 HOW ACCESS CONTROL WORKS:
-- When a query touches a restricted column, an enforcer LLM rewrites the SQL
-- Restrictions are based on exact column name matching
-- Rule types: "self_only" (users see own data) or "role_based" (only certain roles)
+- When a query touches a restricted column, JOINs and WHERE clauses are added automatically
+- SQL is parsed with sqlglot for exact column matching (not substring)
+- Join paths are auto-detected via foreign key relationships
+
+LEARNING & CONTEXT:
+- Use read_context to check schema and previous Q-SQL examples
+- After successful data queries, use write_context with section="sql_examples" to log useful Q-SQL pairs
+- Format: "Q: [user's question] -> SQL: [the query]"
+- This helps you learn patterns for this specific dataset
 """
 
-    async def run_query_async(user_input: str):
+    # Session state for conversation persistence
+    session_id = None
+
+    async def run_query_async(user_input: str, resume_session: str = None):
         """Run a single query through the Agent SDK"""
+        nonlocal session_id
+
         options = ClaudeAgentOptions(
             mcp_servers={
                 "text2sql": {
                     "command": sys.executable,
                     "args": [server_path, "--mcp"],
                     "env": {
+                        **os.environ,  # Keep existing env (PATH, etc.)
                         "ANTHROPIC_API_KEY": api_key,
-                        "GOOGLE_APPLICATION_CREDENTIALS": os.path.join(script_dir, "service_account.json"),
+                        "GOOGLE_APPLICATION_CREDENTIALS": os.path.join(mcp_server_dir, "service_account.json"),
                     },
                 }
             },
@@ -167,29 +184,26 @@ HOW ACCESS CONTROL WORKS:
             system_prompt=system_prompt,
         )
 
+        # Resume previous session if we have one
+        if resume_session:
+            options.resume = resume_session
+
         async for message in query(prompt=user_input, options=options):
             if isinstance(message, SystemMessage):
-                # Check MCP connection status on init
-                pass  # SDK handles connection internally
-            elif isinstance(message, AssistantMessage):
-                # Assistant text response
-                if hasattr(message, 'content') and message.content:
-                    print(f"\n{message.content}")
+                # Capture session ID for future queries
+                if hasattr(message, 'session_id') and message.session_id:
+                    session_id = message.session_id
             elif isinstance(message, TaskProgressMessage):
-                # Tool use progress
+                # Tool use progress - show tool name briefly
                 if hasattr(message, 'tool_name'):
-                    print(f"\n[Tool: {message.tool_name}]")
-                if hasattr(message, 'content') and message.content:
-                    result_str = str(message.content)
-                    if len(result_str) > 500:
-                        print(result_str[:500] + "...")
-                    else:
-                        print(result_str)
+                    tool_name = message.tool_name.replace('mcp__text2sql__', '')
+                    print(f"  [{tool_name}]", end="", flush=True)
             elif isinstance(message, ResultMessage):
+                # Final result - this is the only place we print the response
                 if message.subtype == "success":
                     if hasattr(message, 'result') and message.result:
                         print(f"\n{message.result}")
-                else:
+                elif message.subtype == "error":
                     print(f"\nError: {getattr(message, 'error', 'Unknown error')}")
 
     # Main chat loop
@@ -207,8 +221,13 @@ HOW ACCESS CONTROL WORKS:
             print("Goodbye!")
             break
 
-        # Run the query through Agent SDK
-        asyncio.run(run_query_async(user_input))
+        if user_input.lower() == "new":
+            session_id = None
+            print("Started new session.")
+            continue
+
+        # Run the query through Agent SDK, resuming session if available
+        asyncio.run(run_query_async(user_input, resume_session=session_id))
         print()
 
 

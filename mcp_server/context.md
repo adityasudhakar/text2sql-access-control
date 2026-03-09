@@ -1,0 +1,98 @@
+# Schema for thelook-459020.thelook
+
+## distribution_centers
+- id (INTEGER)
+- name (STRING)
+- latitude (FLOAT)
+- longitude (FLOAT)
+- distribution_center_geom (GEOGRAPHY)
+
+## events
+- id (INTEGER)
+- user_id (INTEGER)
+- sequence_number (INTEGER)
+- session_id (STRING)
+- created_at (TIMESTAMP)
+- ip_address (STRING)
+- city (STRING)
+- state (STRING)
+- postal_code (STRING)
+- browser (STRING)
+- traffic_source (STRING)
+- uri (STRING)
+- event_type (STRING)
+
+## inventory_items
+- id (INTEGER)
+- product_id (INTEGER)
+- created_at (TIMESTAMP)
+- sold_at (TIMESTAMP)
+- cost (FLOAT)
+- product_category (STRING)
+- product_name (STRING)
+- product_brand (STRING)
+- product_retail_price (FLOAT)
+- product_department (STRING)
+- product_sku (STRING)
+- product_distribution_center_id (INTEGER)
+
+## order_items
+- id (INTEGER)
+- order_id (INTEGER)
+- user_id (INTEGER)
+- product_id (INTEGER)
+- inventory_item_id (INTEGER)
+- status (STRING)
+- created_at (TIMESTAMP)
+- shipped_at (TIMESTAMP)
+- delivered_at (TIMESTAMP)
+- returned_at (TIMESTAMP)
+- sale_price (FLOAT)
+
+## orders
+- order_id (INTEGER)
+- user_id (INTEGER)
+- status (STRING)
+- gender (STRING)
+- created_at (TIMESTAMP)
+- returned_at (TIMESTAMP)
+- shipped_at (TIMESTAMP)
+- delivered_at (TIMESTAMP)
+- num_of_item (INTEGER)
+
+## products
+- id (INTEGER)
+- cost (FLOAT)
+- category (STRING)
+- name (STRING)
+- brand (STRING)
+- retail_price (FLOAT)
+- department (STRING)
+- sku (STRING)
+- distribution_center_id (INTEGER)
+
+## sales_people
+- id (INTEGER)
+- username (STRING)
+- name (STRING)
+- geography (STRING)
+- department (STRING)
+
+## users
+- id (INTEGER)
+- first_name (STRING)
+- last_name (STRING)
+- email (STRING)
+- age (INTEGER)
+- gender (STRING)
+- state (STRING)
+- street_address (STRING)
+- postal_code (STRING)
+- city (STRING)
+- country (STRING)
+- latitude (FLOAT)
+- longitude (FLOAT)
+- traffic_source (STRING)
+- created_at (TIMESTAMP)
+- user_geom (GEOGRAPHY)
+
