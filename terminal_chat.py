@@ -1,94 +1,21 @@
 #!/usr/bin/env python3
 """
-CLI for Text-to-SQL with Access Control
+Terminal Chat for Text-to-SQL with Access Control
 
 Usage:
-    text2sql init      - Initialize configuration (dataset, credentials)
-    text2sql serve     - Run as MCP server (for use with Claude Desktop, etc.)
-    text2sql chat      - Run standalone interactive chat mode
+    python terminal_chat.py
 """
 
 import sys
 import os
 import json
-import subprocess
+import asyncio
+from dotenv import load_dotenv
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ResultMessage, AssistantMessage, TextBlock, ToolUseBlock
 
 
-def cmd_init():
-    """Initialize configuration"""
-    print("=" * 60)
-    print("  TEXT-TO-SQL ACCESS CONTROL - Setup")
-    print("=" * 60)
-
-    # Get directory where this script lives
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    config = {}
-    config_file = os.path.join(script_dir, "config.json")
-
-    # Load existing config if present
-    if os.path.exists(config_file):
-        with open(config_file, "r") as f:
-            config = json.load(f)
-        print(f"\nExisting configuration found.")
-        print(f"  Dataset: {config.get('dataset', 'NOT SET')}")
-        print(f"  Users table: {config.get('users_table', 'NOT SET')}")
-        update = input("\nUpdate configuration? (y/N): ").strip().lower()
-        if update != 'y':
-            print("Configuration unchanged.")
-            return
-
-    # Get dataset
-    print("\n1. BigQuery Dataset")
-    print("   Format: project-id.dataset_name")
-    default = config.get('dataset', '')
-    prompt = f"   Dataset [{default}]: " if default else "   Dataset: "
-    dataset = input(prompt).strip() or default
-
-    if not dataset:
-        print("Error: Dataset is required.")
-        sys.exit(1)
-
-    config['dataset'] = dataset
-
-    # Check for service account
-    print("\n2. Service Account")
-    sa_file = os.path.join(script_dir, "service_account.json")
-    if os.path.exists(sa_file):
-        print(f"   Found: {sa_file}")
-    else:
-        print(f"   Warning: service_account.json not found.")
-        print(f"   Place your service account JSON file in: {script_dir}")
-
-    # Save config
-    with open(config_file, "w") as f:
-        json.dump(config, f, indent=2)
-
-    print("\n" + "=" * 60)
-    print("  Setup complete!")
-    print("=" * 60)
-    print("\nNext steps:")
-    print("  1. Run 'text2sql serve' to start the MCP server")
-    print("  2. Or run 'text2sql chat' for interactive mode")
-    print("\nIn chat/MCP mode, tell the agent:")
-    print('  - "users are in the sales_people table"')
-    print('  - "set up geography access control"')
-    print('  - "test as Alex Brown"')
-
-
-def cmd_serve():
-    """Run as MCP server (stdio transport)"""
-    # Import and run the server
-    from server import main
-    main()
-
-
-def cmd_chat():
+def main():
     """Run standalone interactive chat mode using Agent SDK with MCP server"""
-    import asyncio
-    from dotenv import load_dotenv
-    from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, ResultMessage, AssistantMessage, TextBlock, ToolUseBlock
-
     # Load .env file if present
     load_dotenv()
 
@@ -102,10 +29,10 @@ def cmd_chat():
         print("  2. Or create a .env file with: ANTHROPIC_API_KEY=sk-ant-...")
         sys.exit(1)
 
-    # Get the path to server.py (in isolated mcp_server directory)
+    # Get the path to mcpserver.py (in isolated mcp_server directory)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     mcp_server_dir = os.path.join(script_dir, "mcp_server")
-    server_path = os.path.join(mcp_server_dir, "server.py")
+    server_path = os.path.join(mcp_server_dir, "mcpserver.py")
 
     print("=" * 60)
     print("  TEXT-TO-SQL WITH ACCESS CONTROL")
@@ -228,25 +155,6 @@ LEARNING & CONTEXT:
         result = asyncio.run(run_chat_session())
         if result != "restart":
             break
-
-
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
-
-    command = sys.argv[1].lower()
-
-    if command == "init":
-        cmd_init()
-    elif command == "serve":
-        cmd_serve()
-    elif command == "chat":
-        cmd_chat()
-    else:
-        print(f"Unknown command: {command}")
-        print(__doc__)
-        sys.exit(1)
 
 
 if __name__ == "__main__":

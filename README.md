@@ -63,27 +63,22 @@ User Query: "What are total sales?"
    ```
 
 2. **Configure credentials**
-   - Place your BigQuery service account JSON as `service_account.json`
+   - Place your BigQuery service account JSON as `mcp_server/service_account.json`
    - Create `.env` with your Anthropic API key:
      ```
      ANTHROPIC_API_KEY=sk-ant-...
      ```
 
-3. **Initialize**
-   ```bash
-   python cli.py init
-   ```
-
 ## Usage
 
-### Standalone Chat Mode (Requires Claude Code)
+### Standalone Chat Mode
 ```bash
-python cli.py chat
+python terminal_chat.py
 ```
 
 **Note:** Chat mode uses the [Claude Agent SDK](https://docs.anthropic.com/en/docs/agents-and-tools/claude-agent-sdk) which requires [Claude Code](https://claude.com/code) to be installed.
 
-### As MCP Server (for Claude Desktop)
+### As MCP Server (for Claude Desktop or other MCP clients)
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ```json
@@ -91,7 +86,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "text2sql": {
       "command": "python",
-      "args": ["/path/to/server.py"]
+      "args": ["/path/to/mcp_server/mcpserver.py"]
     }
   }
 }
@@ -167,10 +162,11 @@ SQL: SELECT SUM(amount) FROM sales
 
 | File | Purpose |
 |------|---------|
-| `server.py` | MCP server with sqlglot-based access control |
-| `cli.py` | CLI (init, serve, chat) |
-| `config.json` | Access rules and FK definitions |
-| `context.md` | Scratchpad for schema/examples |
+| `mcp_server/mcpserver.py` | MCP server with sqlglot-based access control |
+| `mcp_server/config.json` | Access rules and FK definitions |
+| `mcp_server/context.md` | Scratchpad for schema/examples |
+| `terminal_chat.py` | Standalone terminal chat interface |
+| `test_access_control.py` | Unit tests for access control |
 
 ## Limitations
 

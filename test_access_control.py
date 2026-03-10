@@ -6,7 +6,7 @@ Run with: python -m pytest test_access_control.py -v
 import pytest
 from unittest.mock import patch
 
-from server import (
+from mcp_server.mcpserver import (
     _extract_columns_from_sql,
     _check_restricted_columns,
     _apply_access_control,
@@ -135,7 +135,7 @@ class TestExtractColumns:
 # ===========================================
 
 class TestCheckRestrictedColumns:
-    @patch('server._load_schema')
+    @patch('mcp_server.mcpserver._load_schema')
     def test_no_rules_allows_all(self, mock_load_schema):
         mock_load_schema.return_value = MOCK_SCHEMA
         config = {"dataset": "test.dataset", "access_rules": []}
@@ -143,7 +143,7 @@ class TestCheckRestrictedColumns:
         assert error is None
         assert matches == []
 
-    @patch('server._load_schema')
+    @patch('mcp_server.mcpserver._load_schema')
     def test_restricted_column_detected(self, mock_load_schema):
         mock_load_schema.return_value = MOCK_SCHEMA
         matches, error = _check_restricted_columns("SELECT amount FROM sales", MOCK_CONFIG)
@@ -151,14 +151,14 @@ class TestCheckRestrictedColumns:
         assert len(matches) == 1
         assert matches[0]["restricted_column"] == "sales.amount"
 
-    @patch('server._load_schema')
+    @patch('mcp_server.mcpserver._load_schema')
     def test_non_restricted_column_passes(self, mock_load_schema):
         mock_load_schema.return_value = MOCK_SCHEMA
         matches, error = _check_restricted_columns("SELECT id FROM sales", MOCK_CONFIG)
         assert error is None
         assert matches == []
 
-    @patch('server._load_schema')
+    @patch('mcp_server.mcpserver._load_schema')
     def test_schema_error_returns_error(self, mock_load_schema):
         mock_load_schema.return_value = {"error": "Connection failed"}
         matches, error = _check_restricted_columns("SELECT amount FROM sales", MOCK_CONFIG)
@@ -172,8 +172,8 @@ class TestCheckRestrictedColumns:
 # ===========================================
 
 class TestApplyAccessControl:
-    @patch('server._load_schema')
-    @patch('server._check_restricted_columns')
+    @patch('mcp_server.mcpserver._load_schema')
+    @patch('mcp_server.mcpserver._check_restricted_columns')
     def test_admin_mode_no_restrictions(self, mock_check, mock_load_schema):
         """When user is None (admin), no access control applied"""
         result = _apply_access_control("SELECT * FROM sales", None, MOCK_CONFIG)
@@ -181,8 +181,8 @@ class TestApplyAccessControl:
         assert result["sql"] == "SELECT * FROM sales"
         mock_check.assert_not_called()
 
-    @patch('server._load_schema')
-    @patch('server._check_restricted_columns')
+    @patch('mcp_server.mcpserver._load_schema')
+    @patch('mcp_server.mcpserver._check_restricted_columns')
     def test_check_error_denies_access(self, mock_check, mock_load_schema):
         """If column check fails, access is denied (fail-closed)"""
         mock_check.return_value = (None, "Parse error")
@@ -190,15 +190,15 @@ class TestApplyAccessControl:
         assert result.get("access_denied") is True
         assert "Parse error" in result.get("error", "")
 
-    @patch('server._load_schema')
-    @patch('server._check_restricted_columns')
+    @patch('mcp_server.mcpserver._load_schema')
+    @patch('mcp_server.mcpserver._check_restricted_columns')
     def test_no_matches_no_modification(self, mock_check, mock_load_schema):
         """If no restricted columns found, SQL unchanged"""
         mock_check.return_value = ([], None)
         result = _apply_access_control("SELECT id FROM sales", MOCK_USER, MOCK_CONFIG)
         assert result["access_restricted"] is False
 
-    @patch('server._load_schema')
+    @patch('mcp_server.mcpserver._load_schema')
     def test_adds_joins_and_where(self, mock_load_schema):
         mock_load_schema.return_value = MOCK_SCHEMA
         sql = "SELECT SUM(amount) FROM sales"
@@ -216,7 +216,7 @@ class TestApplyAccessControl:
         assert "WHERE" in modified_sql
         assert "bob@acme.com" in result["sql"]
 
-    @patch('server._load_schema')
+    @patch('mcp_server.mcpserver._load_schema')
     def test_handles_alias_in_where(self, mock_load_schema):
         """When original query uses alias, WHERE should use alias"""
         mock_load_schema.return_value = MOCK_SCHEMA
@@ -239,7 +239,7 @@ class TestApplyAccessControl:
         # The WHERE should reference 's' (alias), not 'sales'
         assert "s.territory" in result["sql"] or "sales.territory" in result["sql"]
 
-    @patch('server._load_schema')
+    @patch('mcp_server.mcpserver._load_schema')
     def test_missing_user_field_denied(self, mock_load_schema):
         """If user is missing required field, access denied"""
         mock_load_schema.return_value = MOCK_SCHEMA
@@ -248,7 +248,7 @@ class TestApplyAccessControl:
         assert result.get("access_denied") is True
         assert "missing required field" in result.get("error", "").lower()
 
-    @patch('server._load_schema')
+    @patch('mcp_server.mcpserver._load_schema')
     def test_sql_injection_in_user_value_escaped(self, mock_load_schema):
         """User value with quotes should be safely escaped via AST"""
         mock_load_schema.return_value = MOCK_SCHEMA
