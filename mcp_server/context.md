@@ -96,3 +96,8 @@
 - created_at (TIMESTAMP)
 - user_geom (GEOGRAPHY)
 
+
+
+## Sql Examples
+
+Q: what are total sales? -> SQL: SELECT SUM(sale_price) FROM order_items

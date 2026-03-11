@@ -1,3 +1,20 @@
 {
-  "dataset": "thelook-459020.thelook"
+  "dataset": "thelook-459020.thelook",
+  "foreign_keys": [
+    {
+      "from_table": "users",
+      "from_column": "state",
+      "to_table": "sales_people",
+      "to_column": "geography"
+    }
+  ],
+  "users_table": "sales_people",
+  "access_rules": [
+    {
+      "restricted_column": "users.email",
+      "user_identifier_column": "users.state",
+      "user_field": "geography",
+      "join_path": []
+    }
+  ]
 }
